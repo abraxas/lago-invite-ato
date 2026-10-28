@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/lago-invite-ato">lago-invite-ato</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/lago-invite-ato"><strong>https://abraxaslabs.tech/research/lago-invite-ato</strong></a>
+</p>
+
 
 # lago-invite-ato
 
